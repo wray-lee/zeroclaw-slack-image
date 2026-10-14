@@ -1,8 +1,11 @@
-name: build zeroclaw (debian + slack)
+name: build zeroclaw (debian + slack + patches)
 
 on:
   schedule:
-    - cron: "17 3 * * *"          # daily: build only when upstream has a new release
+    - cron: "17 3 * * *"          # daily: build only when upstream release or patches changed
+  push:
+    branches: [main]
+    paths: ["patches/**", ".github/workflows/build.yml"]
   workflow_dispatch:
     inputs:
       tag:
@@ -30,22 +33,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve upstream tag
+      # Image tag = upstream tag + hash of the patch set, so editing a patch triggers a rebuild.
+      - name: Resolve tags
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ inputs.tag }}"
           [ -n "$tag" ] || tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          rev=$(cat self/patches/*.patch 2>/dev/null | sha256sum | cut -c1-8)
+          full="$tag-debian-slack-$rev"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:$tag-debian-slack" >/dev/null 2>&1; then
-            echo "$IMAGE:$tag-debian-slack already exists, skipping"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "image tag: $full"
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:$full" >/dev/null 2>&1; then
+            echo "$IMAGE:$full already exists, skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -61,6 +73,15 @@ jobs:
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ steps.tag.outputs.tag }}
+          path: src
+
+      - name: Apply patches
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          for p in self/patches/*.patch; do
+            echo "applying $p"
+            git -C src apply --verbose "../$p"
+          done
 
       # Official images are built from the Dockerfile's generated `dist` feature list,
       # which omits channel-slack. Reuse that list and add only channel-slack.
@@ -68,7 +89,7 @@ jobs:
         id: flags
         if: steps.tag.outputs.skip != 'true'
         run: |
-          flags=$(sed -n 's/^ARG ZEROCLAW_CARGO_FLAGS="\(.*\)"$/\1/p' Dockerfile.debian)
+          flags=$(sed -n 's/^ARG ZEROCLAW_CARGO_FLAGS="\(.*\)"$/\1/p' src/Dockerfile.debian)
           [ -n "$flags" ] || { echo "ZEROCLAW_CARGO_FLAGS not found in Dockerfile.debian"; exit 1; }
           case "$flags" in *channel-slack*) ;; *) flags="$flags,channel-slack" ;; esac
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
@@ -81,15 +102,15 @@ jobs:
         if: steps.tag.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: Dockerfile.debian
+          context: src
+          file: src/Dockerfile.debian
           platforms: linux/amd64
           build-args: ZEROCLAW_CARGO_FLAGS=${{ steps.flags.outputs.flags }}
           load: true
           tags: zeroclaw:candidate
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.full }}
 
       # Target hosts are x86-64-v2 (no AVX2): refuse binaries that require v3/v4.
       - name: Verify binary
@@ -102,12 +123,12 @@ jobs:
           echo "ISA note: ${isa:-none}"
           if echo "$isa" | grep -qE 'x86-64-v[34]'; then echo "binary requires x86-64-v3+"; exit 1; fi
           grep -q 'slack.com/api' ./zc-bin || { echo "channel-slack not compiled in"; exit 1; }
+          grep -q 'hourglass_flowing_sand' ./zc-bin || { echo "ack-reaction patch not compiled in"; exit 1; }
 
       - name: Push
         if: steps.tag.outputs.skip != 'true'
         run: |
-          tag=${{ steps.tag.outputs.tag }}
-          for t in "$tag-debian-slack" debian-slack; do
+          for t in "${{ steps.tag.outputs.full }}" debian-slack; do
             docker tag zeroclaw:candidate "$IMAGE:$t"
             docker push "$IMAGE:$t"
           done

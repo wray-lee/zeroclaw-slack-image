@@ -1,0 +1,108 @@
+diff --git a/crates/zeroclaw-channels/src/orchestrator/mod.rs b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+index 34a1335..f06edde 100644
+--- a/crates/zeroclaw-channels/src/orchestrator/mod.rs
++++ b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+@@ -6106,9 +6106,9 @@ async fn reconcile_early_ack(
+         let _ = task.await;
+     }
+     let _ = channel
+-        .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
++        .remove_reaction(&msg.reply_target, &msg.id, "\u{23F3}")
+         .await;
+-    if let Some(emoji) = done_emoji {
++    if let Some(emoji) = done_emoji.filter(|e| *e != "\u{2705}") {
+         let _ = channel
+             .add_reaction(&msg.reply_target, &msg.id, emoji)
+             .await;
+@@ -6288,7 +6288,7 @@ async fn process_channel_message_body(
+                 message_id: message_id_label.as_str(),
+                 => async move {
+                     if let Err(e) = channel
+-                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
++                        .add_reaction(&reply_target, &message_id, "\u{23F3}")
+                         .await
+                     {
+                         ::zeroclaw_log::record!(
+@@ -8013,11 +8013,13 @@ async fn process_channel_message_body(
+             let _ = task.await;
+         }
+         let _ = channel
+-            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+-            .await;
+-        let _ = channel
+-            .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
++            .remove_reaction(&msg.reply_target, &msg.id, "\u{23F3}")
+             .await;
++        if reaction_done_emoji != "\u{2705}" {
++            let _ = channel
++                .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
++                .await;
++        }
+     }
+ }
+ 
+diff --git a/crates/zeroclaw-channels/src/slack.rs b/crates/zeroclaw-channels/src/slack.rs
+index 80aa80d..dcdae89 100644
+--- a/crates/zeroclaw-channels/src/slack.rs
++++ b/crates/zeroclaw-channels/src/slack.rs
+@@ -400,6 +400,7 @@ fn extract_slack_ts(message_id: &str) -> &str {
+ fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
+     match emoji {
+         "\u{1F440}" => "eyes",                        // 👀
++        "\u{23F3}" => "hourglass_flowing_sand",      // ⏳
+         "\u{2705}" => "white_check_mark",             // ✅
+         "\u{26A0}\u{FE0F}" | "\u{26A0}" => "warning", // ⚠️
+         "\u{274C}" => "x",                            // ❌
+diff --git a/crates/zeroclaw-channels/src/telegram.rs b/crates/zeroclaw-channels/src/telegram.rs
+index 6226651..412895a 100644
+--- a/crates/zeroclaw-channels/src/telegram.rs
++++ b/crates/zeroclaw-channels/src/telegram.rs
+@@ -27,7 +27,7 @@ const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
+ const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
+ const TELEGRAM_FENCE_REOPEN: &str = "```\n";
+ const TELEGRAM_FENCE_CLOSE: &str = "```";
+-const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
++const TELEGRAM_ACK_REACTIONS: &[&str] = &["👀"];
+ 
+ /// Metadata for an incoming document or photo attachment.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -4170,6 +4170,39 @@ impl ::zeroclaw_api::attribution::Attributable for TelegramChannel {
+ 
+ #[async_trait]
+ impl Channel for TelegramChannel {
++    /// Withdraw the bot's ack reaction once the reply is done. A bot has a single
++    /// reaction slot per message, so setting an empty list clears it.
++    async fn remove_reaction(
++        &self,
++        channel_id: &str,
++        message_id: &str,
++        _emoji: &str,
++    ) -> anyhow::Result<()> {
++        let (chat_id, _) = Self::parse_reply_target(channel_id);
++        let Some(msg_id) = message_id
++            .rsplit('_')
++            .next()
++            .and_then(|s| s.parse::<i64>().ok())
++        else {
++            return Ok(());
++        };
++        let body = serde_json::json!({
++            "chat_id": chat_id,
++            "message_id": msg_id,
++            "reaction": []
++        });
++        let resp = self
++            .http_client()
++            .post(self.api_url("setMessageReaction"))
++            .json(&body)
++            .send()
++            .await?;
++        if !resp.status().is_success() {
++            anyhow::bail!("Telegram setMessageReaction (clear) failed: {}", resp.status());
++        }
++        Ok(())
++    }
++
+     fn name(&self) -> &str {
+         "telegram"
+     }
