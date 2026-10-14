@@ -1,0 +1,113 @@
+name: build zeroclaw (debian + slack)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"          # daily: build only when upstream has a new release
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag (default: latest release)"
+        required: false
+      force:
+        description: "Rebuild even if the image tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: zeroclaw-labs/zeroclaw
+  IMAGE: ghcr.io/${{ github.repository_owner }}/zeroclaw
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:$tag-debian-slack" >/dev/null 2>&1; then
+            echo "$IMAGE:$tag-debian-slack already exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Free disk space
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af >/dev/null
+          df -h /
+
+      - uses: actions/checkout@v4
+        if: steps.tag.outputs.skip != 'true'
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # Official images are built from the Dockerfile's generated `dist` feature list,
+      # which omits channel-slack. Reuse that list and add only channel-slack.
+      - name: Cargo flags
+        id: flags
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          flags=$(sed -n 's/^ARG ZEROCLAW_CARGO_FLAGS="\(.*\)"$/\1/p' Dockerfile.debian)
+          [ -n "$flags" ] || { echo "ZEROCLAW_CARGO_FLAGS not found in Dockerfile.debian"; exit 1; }
+          case "$flags" in *channel-slack*) ;; *) flags="$flags,channel-slack" ;; esac
+          echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "$flags"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.tag.outputs.skip != 'true'
+
+      - name: Build
+        if: steps.tag.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.debian
+          platforms: linux/amd64
+          build-args: ZEROCLAW_CARGO_FLAGS=${{ steps.flags.outputs.flags }}
+          load: true
+          tags: zeroclaw:candidate
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.tag }}
+
+      # Target hosts are x86-64-v2 (no AVX2): refuse binaries that require v3/v4.
+      - name: Verify binary
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          docker run --rm zeroclaw:candidate --version
+          bin=$(docker run --rm --entrypoint sh zeroclaw:candidate -c 'command -v zeroclaw')
+          cid=$(docker create zeroclaw:candidate); docker cp "$cid:$bin" ./zc-bin; docker rm "$cid" >/dev/null
+          isa=$(readelf -n ./zc-bin | grep -i 'ISA needed' || true)
+          echo "ISA note: ${isa:-none}"
+          if echo "$isa" | grep -qE 'x86-64-v[34]'; then echo "binary requires x86-64-v3+"; exit 1; fi
+          grep -q 'slack.com/api' ./zc-bin || { echo "channel-slack not compiled in"; exit 1; }
+
+      - name: Push
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          tag=${{ steps.tag.outputs.tag }}
+          for t in "$tag-debian-slack" debian-slack; do
+            docker tag zeroclaw:candidate "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
